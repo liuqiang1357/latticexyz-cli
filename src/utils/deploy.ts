@@ -67,9 +67,6 @@ export async function deploy(
 
   await setInternalFeePerGas(priorityFeeMultiplier);
 
-  // Catch all to await any promises before exiting the script
-  let promises: Promise<unknown>[] = [];
-
   // Get block number before deploying
   const blockNumber = Number(await cast(["block-number", "--rpc-url", rpc], { profile }));
   console.log("Start deployment at block", blockNumber);
@@ -79,50 +76,47 @@ export async function deploy(
     World: worldAddress
       ? Promise.resolve(worldAddress)
       : worldContractName
-      ? deployContractByName(worldContractName, disableTxWait)
-      : deployContract(IBaseWorldData.abi, WorldData.bytecode, disableTxWait, "World"),
+      ? Promise.resolve(await deployContractByName(worldContractName, disableTxWait))
+      : Promise.resolve(await deployContract(IBaseWorldData.abi, WorldData.bytecode, disableTxWait, "World")),
   };
 
   // Deploy Systems
-  const systemPromises = Object.keys(resolvedConfig.systems).reduce<Record<string, Promise<string>>>(
-    (acc, systemName) => {
-      acc[systemName] = deployContractByName(systemName, disableTxWait);
-      return acc;
-    },
-    {}
-  );
+  const systemPromises: Record<string, Promise<string>> = {};
+  for (const systemName of Object.keys(resolvedConfig.systems)) {
+    systemPromises[systemName] = Promise.resolve(await deployContractByName(systemName, disableTxWait));
+  }
 
   // Deploy default World modules
   const defaultModules: Record<string, Promise<string>> = {
     // TODO: these only need to be deployed once per chain, add a check if they exist already
-    CoreModule: deployContract(CoreModuleData.abi, CoreModuleData.bytecode, disableTxWait, "CoreModule"),
-    KeysWithValueModule: deployContract(
+    CoreModule: Promise.resolve(await deployContract(CoreModuleData.abi, CoreModuleData.bytecode, disableTxWait, "CoreModule")),
+    KeysWithValueModule: Promise.resolve(await deployContract(
       KeysWithValueModuleData.abi,
       KeysWithValueModuleData.bytecode,
       disableTxWait,
       "KeysWithValueModule"
-    ),
-    KeysInTableModule: deployContract(
+    )),
+    KeysInTableModule: Promise.resolve(await deployContract(
       KeysInTableModuleData.abi,
       KeysInTableModuleData.bytecode,
       disableTxWait,
       "KeysInTableModule"
-    ),
-    UniqueEntityModule: deployContract(
+    )),
+    UniqueEntityModule: Promise.resolve(await deployContract(
       UniqueEntityModuleData.abi,
       UniqueEntityModuleData.bytecode,
       disableTxWait,
       "UniqueEntityModule"
-    ),
+    )),
   };
 
   // Deploy user Modules
-  const modulePromises = mudConfig.modules
-    .filter((module) => !defaultModules[module.name]) // Only deploy user modules here, not default modules
-    .reduce<Record<string, Promise<string>>>((acc, module) => {
-      acc[module.name] = deployContractByName(module.name, disableTxWait);
-      return acc;
-    }, defaultModules);
+  const modulePromises: Record<string, Promise<string>> = defaultModules;
+
+// Only deploy user modules here, not default modules
+  for (const module of mudConfig.modules.filter((module) => !defaultModules[module.name])) {
+    modulePromises[module.name] = Promise.resolve(await deployContractByName(module.name, disableTxWait));
+  }
 
   // Combine all contracts into one object
   const contractPromises: Record<string, Promise<string>> = { ...worldPromise, ...systemPromises, ...modulePromises };
@@ -144,164 +138,135 @@ export async function deploy(
 
   // Register tables
   const tableIds: { [tableName: string]: Uint8Array } = {};
-  promises = [
-    ...promises,
-    ...Object.entries(mudConfig.tables).map(async ([tableName, { name, schema, keySchema }]) => {
-      console.log(chalk.blue(`Registering table ${tableName} at ${namespace}/${name}`));
+  for (const [tableName, { name, schema, keySchema }] of Object.entries(mudConfig.tables)) {
+    console.log(chalk.blue(`Registering table ${tableName} at ${namespace}/${name}`));
 
-      // Store the tableId for later use
-      tableIds[tableName] = toResourceSelector(namespace, name);
+    // Store the tableId for later use
+    tableIds[tableName] = toResourceSelector(namespace, name);
 
-      // Register table
-      const schemaTypes = Object.values(schema).map((abiOrUserType) => {
-        const { schemaType } = resolveAbiOrUserType(abiOrUserType, mudConfig);
-        return schemaType;
-      });
+    // Register table
+    const schemaTypes = Object.values(schema).map((abiOrUserType) => {
+      const { schemaType } = resolveAbiOrUserType(abiOrUserType, mudConfig);
+      return schemaType;
+    });
 
-      const keyTypes = Object.values(keySchema).map((abiOrUserType) => {
-        const { schemaType } = resolveAbiOrUserType(abiOrUserType, mudConfig);
-        return schemaType;
-      });
+    const keyTypes = Object.values(keySchema).map((abiOrUserType) => {
+      const { schemaType } = resolveAbiOrUserType(abiOrUserType, mudConfig);
+      return schemaType;
+    });
 
-      await fastTxExecute(
-        WorldContract,
-        "registerTable",
-        [
-          tableIdToHex(namespace, name),
-          encodeSchema(keyTypes),
-          encodeSchema(schemaTypes),
-          Object.keys(keySchema),
-          Object.keys(schema),
-        ],
-        confirmations
-      );
+    await fastTxExecute(
+      WorldContract,
+      "registerTable",
+      [
+        tableIdToHex(namespace, name),
+        encodeSchema(keyTypes),
+        encodeSchema(schemaTypes),
+        Object.keys(keySchema),
+        Object.keys(schema),
+      ],
+      confirmations
+    );
 
-      console.log(chalk.green(`Registered table ${tableName} at ${name}`));
-    }),
-  ];
+    console.log(chalk.green(`Registered table ${tableName} at ${name}`));
+  }
 
   // Register systems (using forEach instead of for..of to avoid blocking on async calls)
-  promises = [
-    ...promises,
-    ...Object.entries(resolvedConfig.systems).map(
-      async ([systemName, { name, openAccess, registerFunctionSelectors }]) => {
-        // Register system at route
-        console.log(chalk.blue(`Registering system ${systemName} at ${namespace}/${name}`));
-        await fastTxExecute(
-          WorldContract,
-          "registerSystem",
-          [tableIdToHex(namespace, name), await contractPromises[systemName], openAccess],
-          confirmations
-        );
-        console.log(chalk.green(`Registered system ${systemName} at ${namespace}/${name}`));
+  for (const [systemName, { name, openAccess, registerFunctionSelectors }] of Object.entries(resolvedConfig.systems)) {
+    // Register system at route
+    console.log(chalk.blue(`Registering system ${systemName} at ${namespace}/${name}`));
+    await fastTxExecute(
+      WorldContract,
+      "registerSystem",
+      [tableIdToHex(namespace, name), await contractPromises[systemName], openAccess],
+      confirmations
+    );
+    console.log(chalk.green(`Registered system ${systemName} at ${namespace}/${name}`));
 
-        // Register function selectors for the system
-        if (registerFunctionSelectors) {
-          const functionSignatures: FunctionSignature[] = await loadFunctionSignatures(systemName);
-          const isRoot = namespace === "";
-          // Using Promise.all to avoid blocking on async calls
-          await Promise.all(
-            functionSignatures.map(async ({ functionName, functionArgs }) => {
-              const functionSignature = isRoot
-                ? functionName + functionArgs
-                : `${namespace}_${name}_${functionName}${functionArgs}`;
+    // Register function selectors for the system
+    if (registerFunctionSelectors) {
+      const functionSignatures: FunctionSignature[] = await loadFunctionSignatures(systemName);
+      const isRoot = namespace === "";
+      // Using Promise.all to avoid blocking on async calls
+      for (const { functionName, functionArgs } of functionSignatures) {
+        const functionSignature = isRoot
+        ? functionName + functionArgs
+        : `${namespace}_${name}_${functionName}${functionArgs}`;
 
-              console.log(chalk.blue(`Registering function "${functionSignature}"`));
-              if (isRoot) {
-                const worldFunctionSelector = toFunctionSelector(
-                  functionSignature === ""
-                    ? { functionName: systemName, functionArgs } // Register the system's fallback function as `<systemName>(<args>)`
-                    : { functionName, functionArgs }
-                );
-                const systemFunctionSelector = toFunctionSelector({ functionName, functionArgs });
-                await fastTxExecute(
-                  WorldContract,
-                  "registerRootFunctionSelector",
-                  [tableIdToHex(namespace, name), worldFunctionSelector, systemFunctionSelector],
-                  confirmations
-                );
-              } else {
-                await fastTxExecute(
-                  WorldContract,
-                  "registerFunctionSelector",
-                  [tableIdToHex(namespace, name), functionName, functionArgs],
-                  confirmations
-                );
-              }
-              console.log(chalk.green(`Registered function "${functionSignature}"`));
-            })
+        console.log(chalk.blue(`Registering function "${functionSignature}"`));
+        if (isRoot) {
+          const worldFunctionSelector = toFunctionSelector(
+            functionSignature === ""
+              ? { functionName: systemName, functionArgs } // Register the system's fallback function as `<systemName>(<args>)`
+              : { functionName, functionArgs }
+          );
+          const systemFunctionSelector = toFunctionSelector({ functionName, functionArgs });
+          await fastTxExecute(
+            WorldContract,
+            "registerRootFunctionSelector",
+            [tableIdToHex(namespace, name), worldFunctionSelector, systemFunctionSelector],
+            confirmations
+          );
+        } else {
+          await fastTxExecute(
+            WorldContract,
+            "registerFunctionSelector",
+            [tableIdToHex(namespace, name), functionName, functionArgs],
+            confirmations
           );
         }
+        console.log(chalk.green(`Registered function "${functionSignature}"`));
       }
-    ),
-  ];
+    }
+  }
 
-  // Wait for resources to be registered before granting access to them
-  await Promise.all(promises); // ----------------------------------------------------------------------------------------------
-  promises = [];
 
   // Grant access to systems
   for (const [systemName, { name, accessListAddresses, accessListSystems }] of Object.entries(resolvedConfig.systems)) {
     const resourceSelector = `${namespace}/${name}`;
 
     // Grant access to addresses
-    promises = [
-      ...promises,
-      ...accessListAddresses.map(async (address) => {
-        console.log(chalk.blue(`Grant ${address} access to ${systemName} (${resourceSelector})`));
-        await fastTxExecute(WorldContract, "grantAccess", [tableIdToHex(namespace, name), address], confirmations);
-        console.log(chalk.green(`Granted ${address} access to ${systemName} (${namespace}/${name})`));
-      }),
-    ];
+    for (const address of accessListAddresses) {
+      console.log(chalk.blue(`Grant ${address} access to ${systemName} (${resourceSelector})`));
+      await fastTxExecute(WorldContract, "grantAccess", [tableIdToHex(namespace, name), address], confirmations);
+      console.log(chalk.green(`Granted ${address} access to ${systemName} (${namespace}/${name})`));
+    }
 
     // Grant access to other systems
-    promises = [
-      ...promises,
-      ...accessListSystems.map(async (granteeSystem) => {
-        console.log(chalk.blue(`Grant ${granteeSystem} access to ${systemName} (${resourceSelector})`));
-        await fastTxExecute(
-          WorldContract,
-          "grantAccess",
-          [tableIdToHex(namespace, name), await contractPromises[granteeSystem]],
-          confirmations
-        );
-        console.log(chalk.green(`Granted ${granteeSystem} access to ${systemName} (${resourceSelector})`));
-      }),
-    ];
-  }
-
-  // Wait for access to be granted before installing modules
-  await Promise.all(promises); // ----------------------------------------------------------------------------------------------
-  promises = [];
-
-  // Install modules
-  promises = [
-    ...promises,
-    ...mudConfig.modules.map(async (module) => {
-      console.log(chalk.blue(`Installing${module.root ? " root " : " "}module ${module.name}`));
-      // Resolve arguments
-      const resolvedArgs = await Promise.all(
-        module.args.map((arg) => resolveWithContext(arg, { tableIds, systemAddresses: contractPromises }))
-      );
-      const values = resolvedArgs.map((arg) => arg.value);
-      const types = resolvedArgs.map((arg) => arg.type);
-      const moduleAddress = await contractPromises[module.name];
-      if (!moduleAddress) throw new Error(`Module ${module.name} not found`);
-
-      // Send transaction to install module
+    for (const granteeSystem of accessListSystems) {
+      console.log(chalk.blue(`Grant ${granteeSystem} access to ${systemName} (${resourceSelector})`));
       await fastTxExecute(
         WorldContract,
-        module.root ? "installRootModule" : "installModule",
-        [moduleAddress, abi.encode(types, values)],
+        "grantAccess",
+        [tableIdToHex(namespace, name), await contractPromises[granteeSystem]],
         confirmations
       );
+      console.log(chalk.green(`Granted ${granteeSystem} access to ${systemName} (${resourceSelector})`));
+    }
+  }
 
-      console.log(chalk.green(`Installed${module.root ? " root " : " "}module ${module.name}`));
-    }),
-  ];
+  // Install modules
+  for (const module of mudConfig.modules) {
+    console.log(chalk.blue(`Installing${module.root ? " root " : " "}module ${module.name}`));
+    // Resolve arguments
+    const resolvedArgs = await Promise.all(
+      module.args.map((arg) => resolveWithContext(arg, { tableIds, systemAddresses: contractPromises }))
+    );
+    const values = resolvedArgs.map((arg) => arg.value);
+    const types = resolvedArgs.map((arg) => arg.type);
+    const moduleAddress = await contractPromises[module.name];
+    if (!moduleAddress) throw new Error(`Module ${module.name} not found`);
 
-  // Await all promises before executing PostDeploy script
-  await Promise.all(promises); // ----------------------------------------------------------------------------------------------
+    // Send transaction to install module
+    await fastTxExecute(
+      WorldContract,
+      module.root ? "installRootModule" : "installModule",
+      [moduleAddress, abi.encode(types, values)],
+      confirmations
+    );
+
+    console.log(chalk.green(`Installed${module.root ? " root " : " "}module ${module.name}`));
+  }
 
   // Confirm the current nonce is the expected nonce to make sure all transactions have been included
   let remoteNonce = await signer.getTransactionCount();
@@ -323,8 +288,6 @@ export async function deploy(
     );
   }
 
-  promises = [];
-
   // Execute postDeploy forge script
   const postDeployPath = path.join(await getScriptDirectory(), postDeployScript + ".s.sol");
   if (existsSync(postDeployPath)) {
@@ -340,6 +303,9 @@ export async function deploy(
         "--rpc-url",
         rpc,
         "-vvv",
+        "--legacy",
+        "--skip-simulation",
+        "--slow"
       ],
       {
         profile,
@@ -391,13 +357,10 @@ export async function deploy(
       const deployPromise = factory
         .deploy({
           nonce: nonce++,
-          maxPriorityFeePerGas,
-          maxFeePerGas,
           gasPrice,
         })
         .then((c) => (disableTxWait ? c : c.deployed()));
 
-      promises.push(deployPromise);
       const { address } = await deployPromise;
 
       console.log(chalk.green("Deployed", contractName, "to", address));
@@ -491,7 +454,6 @@ export async function deploy(
       const txPromise = contract[func]
         .apply(null, [...args, { gasLimit, nonce: nonce++, maxPriorityFeePerGas, maxFeePerGas, gasPrice }])
         .then((tx: any) => (confirmations === 0 ? tx : tx.wait(confirmations)));
-      promises.push(txPromise);
       return txPromise;
     } catch (error: any) {
       if (debug) console.error(error);
